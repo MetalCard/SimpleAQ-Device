@@ -154,5 +154,5 @@ EOF
 # advertisement three minutes after the provisioning service starts.
 on_chroot << EOF
     # Insert configurations directly under the [General] header in main.conf
-    sed -i '/^\[General\]/a ControllerMode = le\nJustWorksRepairing = always\nReverseServiceDiscovery = false\nDiscoverableTimeout = 0' /etc/bluetooth/main.conf
+    sed -i '/^\[General\]/a ControllerMode = le\nJustWorksRepairing = always\nReverseServiceDiscovery = false\nDiscoverableTimeout = 0\nExperimental = true' /etc/bluetooth/main.conf
 EOF
