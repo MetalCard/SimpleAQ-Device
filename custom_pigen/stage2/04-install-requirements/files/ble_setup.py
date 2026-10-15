@@ -98,14 +98,19 @@ def write_token(value, options):
     apply_wifi_credentials()
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     adapters = list(adapter.Adapter.available())
     if not adapters:
+        logging.error("No Bluetooth adapters found!")
         sys.exit(1)
         
     dongle = adapter.Adapter(adapters[0].address)
     ble_peripheral = peripheral.Peripheral(dongle.address, local_name='SimpleAQ_Setup', appearance=0)
 
     ble_peripheral.add_service(srv_id=1, uuid=SERVICE_UUID, primary=True)
+    # Clear primary_services so bluezero doesn't pack the 128-bit UUID into the 31-byte advertisement packet
+    # (The service remains fully registered as a GATT Primary Service in self.services)
+    ble_peripheral.primary_services.clear()
     
     # SSID Characteristic
     ble_peripheral.add_characteristic(srv_id=1, chr_id=1, uuid=SSID_UUID, value=[], notifying=False, flags=['write', 'write-without-response'], read_callback=None, write_callback=write_ssid, notify_callback=None)
