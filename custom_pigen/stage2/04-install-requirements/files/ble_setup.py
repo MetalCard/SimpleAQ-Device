@@ -332,15 +332,29 @@ class Provisioner:
         self._reevaluate_shutdown()
         return False
 
-    def on_connect(self, adapter_address, device_address=None):
-        # bluezero calls this with (adapter, device) on PropertiesChanged and
-        # with a single Device object on InterfacesAdded; we need neither.
+    def on_connect(self, *args, **kwargs):
         log.info("Client connected")
         self._reevaluate_shutdown()
 
-    def on_disconnect(self, adapter_address, device_address):
-        log.info("Client %s disconnected", device_address)
+    def on_disconnect(self, *args, **kwargs):
+        log.info("Client disconnected")
         self._reevaluate_shutdown()
+        if not self.complete and self.peripheral is not None:
+            try:
+                log.info("Resuming BLE advertising...")
+                self.peripheral.ad_manager.register_advertisement(self.peripheral.advert, {})
+                log.info("BLE advertising resumed successfully")
+            except Exception as e:
+                log.warning("Could not re-register advertisement directly: %s. Trying unregister first...", e)
+                try:
+                    self.peripheral.ad_manager.unregister_advertisement(self.peripheral.advert)
+                except Exception:
+                    pass
+                try:
+                    self.peripheral.ad_manager.register_advertisement(self.peripheral.advert, {})
+                    log.info("BLE advertising resumed successfully")
+                except Exception as ex:
+                    log.error("Failed to re-register advertisement: %s", ex)
 
     def _reevaluate_shutdown(self):
         if not self.complete:
