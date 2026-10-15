@@ -115,22 +115,42 @@ def wait_for_internet(window_sec):
         time.sleep(3)
 
 
-def read_device_id():
+def read_device_id(*args, **kwargs):
     bucket = env_value("influx_bucket")
     if bucket and bucket != BUCKET_PLACEHOLDER:
-        return to_bytes(bucket)
-    try:
-        with open("/proc/cpuinfo") as f:
-            for line in f:
-                if line.startswith("Serial"):
-                    return to_bytes(f"SimpleAQ_Pi_{line.split(':')[1].strip()}")
-    except Exception:
-        pass
-    return to_bytes("SimpleAQ_Pi")
+        if "SimpleAQ_Pi_" in bucket:
+            import re
+            m = re.search(r"(SimpleAQ_Pi_[a-zA-Z0-9]+)", bucket)
+            if m:
+                bucket = m.group(1)
+        raw = to_bytes(bucket)
+    else:
+        dev_id = "SimpleAQ_Pi"
+        try:
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if line.startswith("Serial"):
+                        dev_id = f"SimpleAQ_Pi_{line.split(':')[1].strip()}"
+                        break
+        except Exception:
+            pass
+        raw = to_bytes(dev_id)
+
+    # Respect D-Bus ReadValue offset if provided
+    options = kwargs.get("options") or (args[0] if args and isinstance(args[0], dict) else None)
+    if options and isinstance(options, dict) and "offset" in options:
+        offset = int(options["offset"])
+        return raw[offset:]
+    return raw
 
 
-def write_device_id(value, options):
-    device_id = to_text(value)
+def write_device_id(value, options=None):
+    device_id = to_text(value).strip()
+    if "SimpleAQ_Pi_" in device_id:
+        import re
+        m = re.search(r"(SimpleAQ_Pi_[a-zA-Z0-9]+)", device_id)
+        if m:
+            device_id = m.group(1)
     log.info("Device id set to %r", device_id)
     try:
         dotenv.set_key(ENV_FILE, "influx_bucket", device_id)
