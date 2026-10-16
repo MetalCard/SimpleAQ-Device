@@ -1,42 +1,27 @@
 #!/usr/bin/env python3
-"""SimpleAQ BLE provisioning service.
+"""SimpleAQ BLE provisioning service using modern asynchronous Bless (Bleak GATT Server).
 
 Advertises a GATT service that the SimpleAQ app uses to hand the device its
-WiFi credentials, device id and API token.  The protocol is documented in
-README.md under "Using the SimpleAQ app over Bluetooth".
-
-Design notes:
-
-- The service only runs while the device is unprovisioned, meaning there is
-  no real token in /etc/environment.  A provisioned device never advertises,
-  regardless of whether it happens to be online at the moment the service
-  starts.  The reset endpoint clears the token to bring provisioning back.
-- Joining WiFi can take tens of seconds.  It runs on a worker thread so the
-  GATT write that triggers it is acknowledged immediately.  BlueZ dispatches
-  characteristic callbacks on the single GLib main loop, and blocking it
-  there used to trip the phone's 30 second ATT timeout and drop the link.
-- Progress is reported through the STATUS characteristic (read + notify).
-- Credentials go into the "Wifi" NetworkManager profile that the rest of the
-  image (hostap_config.py, wifi-watchdog.sh) already manages, instead of a
-  new profile per SSID.
-- After a successful join the token is persisted and the service keeps
-  advertising until the app disconnects, plus a grace period, so the app can
-  read the final status or reconnect to verify.
+WiFi credentials, device id and API token. Built on Bless/Bleak to handle
+asynchronous D-Bus events, MTU negotiations, and non-blocking I/O reliably.
 """
 
+import asyncio
 import logging
 import os
+import re
 import subprocess
 import sys
-import threading
 import time
+from typing import Any
 
-import dbus
 import dotenv
-from bluezero import adapter
-from bluezero import constants
-from bluezero import peripheral
-from gi.repository import GLib
+from bless import (
+    BlessServer,
+    BlessGATTCharacteristic,
+    GATTCharacteristicProperties,
+    GATTAttributePermissions,
+)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -47,8 +32,6 @@ TOKEN_ENV_FILE = "/etc/simpleaq/device_token.env"
 TOKEN_PLACEHOLDER = "YOUR_TOKEN_HERE"
 BUCKET_PLACEHOLDER = "YOUR_BUCKET_HERE"
 
-# Must match files/wifi.nmconnection; shared with hostap_config.py and
-# wifi-watchdog.sh, which look the profile up by this name.
 WIFI_CONNECTION = "Wifi"
 WIFI_INTERFACE = "wlan0"
 INTERNET_CHECK_HOST = "www.simpleaq.org"
@@ -61,28 +44,18 @@ TOKEN_UUID = "b4250403-fb4b-4746-b2b0-93f0e61122c6"
 DEVICE_ID_UUID = "b4250404-fb4b-4746-b2b0-93f0e61122c6"
 STATUS_UUID = "b4250405-fb4b-4746-b2b0-93f0e61122c6"
 
-# Values of the STATUS characteristic (ASCII strings).
-STATUS_IDLE = "IDLE"                # waiting for SSID, password and token
-STATUS_CONNECTING = "CONNECTING"    # WiFi join in progress
-STATUS_CONNECTED = "CONNECTED"      # online and token saved; provisioning complete
-STATUS_WIFI_FAILED = "WIFI_FAILED"  # could not join the network; re-send credentials
-STATUS_NO_INTERNET = "NO_INTERNET"  # joined WiFi and saved the token, backend unreachable
+STATUS_IDLE = "IDLE"
+STATUS_CONNECTING = "CONNECTING"
+STATUS_CONNECTED = "CONNECTED"
+STATUS_WIFI_FAILED = "WIFI_FAILED"
+STATUS_NO_INTERNET = "NO_INTERNET"
 
-ADAPTER_WAIT_SEC = 60           # how long to wait for hci0 to appear at boot
 WIFI_CONNECT_TIMEOUT_SEC = 45
-INTERNET_CHECK_WINDOW_SEC = 30  # DHCP and DNS can lag the association by a few seconds
-SHUTDOWN_GRACE_SEC = 60         # keep advertising this long after the last client leaves
+INTERNET_CHECK_WINDOW_SEC = 30
+SHUTDOWN_GRACE_SEC = 60
 
 
-def to_text(value):
-    return bytes(value).decode("utf-8", errors="replace")
-
-
-def to_bytes(text):
-    return list(text.encode("utf-8"))
-
-
-def env_value(key):
+def env_value(key: str) -> str:
     try:
         return (dotenv.dotenv_values(ENV_FILE).get(key) or "").strip()
     except Exception as e:
@@ -90,12 +63,12 @@ def env_value(key):
         return ""
 
 
-def is_provisioned():
+def is_provisioned() -> bool:
     token = env_value("influx_token")
     return bool(token) and token != TOKEN_PLACEHOLDER
 
 
-def check_internet(timeout_sec=3):
+def check_internet(timeout_sec=3) -> bool:
     try:
         subprocess.run(["ping", "-c", "1", "-W", str(timeout_sec), INTERNET_CHECK_HOST],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -105,7 +78,7 @@ def check_internet(timeout_sec=3):
         return False
 
 
-def wait_for_internet(window_sec):
+def wait_for_internet(window_sec: int) -> bool:
     deadline = time.monotonic() + window_sec
     while True:
         if check_internet():
@@ -115,50 +88,26 @@ def wait_for_internet(window_sec):
         time.sleep(3)
 
 
-def read_device_id(*args, **kwargs):
+def get_device_id() -> str:
     bucket = env_value("influx_bucket")
     if bucket and bucket != BUCKET_PLACEHOLDER:
-        if "SimpleAQ_Pi_" in bucket:
-            import re
-            m = re.search(r"(SimpleAQ_Pi_[a-zA-Z0-9]+)", bucket)
-            if m:
-                bucket = m.group(1)
-        raw = to_bytes(bucket)
-    else:
-        dev_id = "SimpleAQ_Pi"
-        try:
-            with open("/proc/cpuinfo") as f:
-                for line in f:
-                    if line.startswith("Serial"):
-                        dev_id = f"SimpleAQ_Pi_{line.split(':')[1].strip()}"
-                        break
-        except Exception:
-            pass
-        raw = to_bytes(dev_id)
-
-    # Respect D-Bus ReadValue offset if provided
-    options = kwargs.get("options") or (args[0] if args and isinstance(args[0], dict) else None)
-    if options and isinstance(options, dict) and "offset" in options:
-        offset = int(options["offset"])
-        return raw[offset:]
-    return raw
-
-
-def write_device_id(value, options=None):
-    device_id = to_text(value).strip()
-    if "SimpleAQ_Pi_" in device_id:
-        import re
-        m = re.search(r"(SimpleAQ_Pi_[a-zA-Z0-9]+)", device_id)
+        m = re.search(r"(SimpleAQ_Pi_[a-zA-Z0-9]+)", bucket)
         if m:
-            device_id = m.group(1)
-    log.info("Device id set to %r", device_id)
+            return m.group(1)
+        return bucket
+    dev_id = "SimpleAQ_Pi"
     try:
-        dotenv.set_key(ENV_FILE, "influx_bucket", device_id)
-    except Exception as e:
-        log.error("Failed to update influx_bucket in %s: %s", ENV_FILE, e)
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("Serial"):
+                    dev_id = f"SimpleAQ_Pi_{line.split(':')[1].strip()}"
+                    break
+    except Exception:
+        pass
+    return dev_id
 
 
-def persist_token(token):
+def persist_token(token: str):
     try:
         dotenv.set_key(ENV_FILE, "influx_token", token)
     except Exception as e:
@@ -176,17 +125,12 @@ def nmcli(*args, timeout=60):
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
-def wifi_profile_exists():
+def wifi_profile_exists() -> bool:
     names = nmcli("-t", "-f", "NAME", "connection", "show").stdout.splitlines()
     return WIFI_CONNECTION in names
 
 
-def configure_wifi_profile(ssid, password):
-    """Point the shared "Wifi" profile at the given network.
-
-    Uses the same settings as hostap_config.set_wifi_credentials so both
-    provisioning paths produce an identical profile.
-    """
+def configure_wifi_profile(ssid: str, password: str):
     if not wifi_profile_exists():
         log.warning("NetworkManager profile %r is missing; recreating it", WIFI_CONNECTION)
         nmcli("connection", "add", "type", "wifi", "ifname", WIFI_INTERFACE,
@@ -209,264 +153,191 @@ def configure_wifi_profile(ssid, password):
 
 
 def activate_wifi():
-    # An explicit `up` also clears any manual-deactivation block left by a reset.
     nmcli("--wait", str(WIFI_CONNECT_TIMEOUT_SEC), "connection", "up", WIFI_CONNECTION,
           timeout=WIFI_CONNECT_TIMEOUT_SEC + 15)
 
 
-def connected_client_count():
-    """Ask BlueZ how many devices are connected, rather than trusting callback bookkeeping."""
+def _sync_join(ssid: str, password: str, token: str) -> str:
     try:
-        bus = dbus.SystemBus()
-        manager = dbus.Interface(bus.get_object(constants.BLUEZ_SERVICE_NAME, "/"),
-                                 constants.DBUS_OM_IFACE)
-        objects = manager.GetManagedObjects()
-    except Exception as e:
-        log.warning("Could not query connected clients: %s", e)
-        return 0
-    count = 0
-    for interfaces in objects.values():
-        device = interfaces.get(constants.DEVICE_INTERFACE)
-        if device and bool(device.get("Connected", False)):
-            count += 1
-    return count
+        configure_wifi_profile(ssid, password)
+        activate_wifi()
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or e.stdout or "").strip()
+        log.error("WiFi join failed for %r: %s", ssid, detail)
+        return STATUS_WIFI_FAILED
+    except subprocess.TimeoutExpired:
+        log.error("WiFi join timed out for %r", ssid)
+        return STATUS_WIFI_FAILED
+    except Exception:
+        log.exception("Unexpected error while joining %r", ssid)
+        return STATUS_WIFI_FAILED
+
+    log.info("Joined WiFi network %r", ssid)
+    persist_token(token)
+    subprocess.run(["systemctl", "restart", "simpleaq.service"], check=False)
+
+    if wait_for_internet(INTERNET_CHECK_WINDOW_SEC):
+        log.info("Backend reachable; provisioning complete")
+        return STATUS_CONNECTED
+    else:
+        log.warning("Joined WiFi but %s is unreachable; token saved", INTERNET_CHECK_HOST)
+        return STATUS_NO_INTERNET
 
 
-class Provisioner:
-    def __init__(self):
-        self.ssid = None
-        self.password = None
-        self.token = None
-        self.status = STATUS_IDLE
-        self.status_chrc = None
-        self.peripheral = None
-        self.worker = None
-        self.complete = False
-        self.shutdown_source = None
-        self.join_timer_source = None
+class BlessProvisioner:
+    def __init__(self, loop: asyncio.AbstractEventLoop):
+        self.loop = loop
+        self.server: BlessServer = None
+        self.ssid: str = ""
+        self.password: str = None
+        self.token: str = ""
+        self.status: str = STATUS_IDLE
+        self.join_task: asyncio.Task = None
+        self.stop_event = asyncio.Event()
 
-    # ---- GATT callbacks; BlueZ invokes these on the GLib main loop ----
+    def set_status(self, new_status: str):
+        self.status = new_status
+        log.info("Status -> %s", new_status)
+        if self.server:
+            try:
+                char = self.server.get_characteristic(STATUS_UUID)
+                if char:
+                    char.value = bytearray(new_status.encode("utf-8"))
+                    self.server.update_value(SERVICE_UUID, STATUS_UUID)
+            except Exception as e:
+                log.warning("Failed to notify status: %s", e)
 
-    @staticmethod
-    def _apply_write(current, value, options):
-        chunk = bytes(value)
-        offset = 0
-        if isinstance(options, dict) and "offset" in options:
-            offset = int(options["offset"])
-        if offset > 0 and current:
-            prev = current.encode("utf-8")
-            merged = prev[:offset] + chunk
-            return merged.decode("utf-8", errors="replace")
-        return chunk.decode("utf-8", errors="replace")
+    def read_request(self, characteristic: BlessGATTCharacteristic, **kwargs) -> bytearray:
+        uuid = str(characteristic.uuid).lower()
+        if uuid == DEVICE_ID_UUID:
+            dev_id = get_device_id()
+            log.info("Read Device ID: %r", dev_id)
+            return bytearray(dev_id.encode("utf-8"))
+        elif uuid == STATUS_UUID:
+            log.info("Read Status: %r", self.status)
+            return bytearray(self.status.encode("utf-8"))
+        return bytearray(characteristic.value or b"")
 
-    def write_ssid(self, value, options=None):
-        self.ssid = self._apply_write(self.ssid, value, options)
-        log.info("Received SSID %r", self.ssid)
-        self._maybe_start_join()
+    def write_request(self, characteristic: BlessGATTCharacteristic, value: Any, **kwargs):
+        uuid = str(characteristic.uuid).lower()
+        raw = bytes(value)
+        text = raw.decode("utf-8", errors="replace")
 
-    def write_pass(self, value, options=None):
-        self.password = self._apply_write(self.password, value, options)
-        log.info("Received WiFi password (%d characters)", len(self.password))
-        self._maybe_start_join()
-
-    def write_token(self, value, options=None):
-        self.token = self._apply_write(self.token, value, options)
-        log.info("Received token (%d characters)", len(self.token))
-        self._maybe_start_join()
-
-    def read_status(self):
-        return to_bytes(self.status)
-
-    def on_status_notify(self, notifying, characteristic):
-        # Push the current state to a new subscriber so it never has to poll.
-        if notifying:
-            characteristic.set_value(to_bytes(self.status))
+        if uuid == SSID_UUID:
+            self.ssid = text
+            log.info("Received SSID: %r", self.ssid)
+            self._maybe_start_join()
+        elif uuid == PASS_UUID:
+            self.password = text
+            log.info("Received Wi-Fi password (%d characters)", len(self.password))
+            self._maybe_start_join()
+        elif uuid == TOKEN_UUID:
+            self.token = text
+            log.info("Received token (%d characters)", len(self.token))
+            self._maybe_start_join()
+        elif uuid == DEVICE_ID_UUID:
+            dev_id = text.strip()
+            m = re.search(r"(SimpleAQ_Pi_[a-zA-Z0-9]+)", dev_id)
+            if m:
+                dev_id = m.group(1)
+            log.info("Set Device ID: %r", dev_id)
+            try:
+                dotenv.set_key(ENV_FILE, "influx_bucket", dev_id)
+            except Exception as e:
+                log.error("Failed to update influx_bucket: %s", e)
 
     def _maybe_start_join(self):
         if not self.ssid or self.password is None or not self.token:
             return
-        if self.join_timer_source is not None:
-            GLib.source_remove(self.join_timer_source)
-        # Debounce by 400ms so multi-packet BLE Long Writes (offset > 0) finish arriving first
-        self.join_timer_source = GLib.timeout_add(400, self._execute_join)
-
-    def _execute_join(self):
-        self.join_timer_source = None
-        if not self.ssid or self.password is None or not self.token:
-            return False
-        if self.worker is not None and self.worker.is_alive():
-            log.info("WiFi join already in progress; ignoring repeated write")
-            return False
-        # Allow re-provisioning within the same session.
-        self.complete = False
-        self._cancel_shutdown()
-        self._set_status(STATUS_CONNECTING)
-        self.worker = threading.Thread(target=self._join,
-                                       args=(self.ssid, self.password, self.token),
-                                       daemon=True)
-        self.worker.start()
-        return False
-
-    # ---- worker thread; report back to the main loop through GLib.idle_add ----
-
-    def _join(self, ssid, password, token):
-        try:
-            configure_wifi_profile(ssid, password)
-            activate_wifi()
-        except subprocess.CalledProcessError as e:
-            detail = (e.stderr or e.stdout or "").strip()
-            log.error("WiFi join failed for %r: %s", ssid, detail)
-            GLib.idle_add(self._set_status, STATUS_WIFI_FAILED)
+        if self.join_task and not self.join_task.done():
+            log.info("WiFi join already in progress; ignoring write")
             return
-        except subprocess.TimeoutExpired:
-            log.error("WiFi join timed out for %r", ssid)
-            GLib.idle_add(self._set_status, STATUS_WIFI_FAILED)
-            return
-        except Exception:
-            log.exception("Unexpected error while joining %r", ssid)
-            GLib.idle_add(self._set_status, STATUS_WIFI_FAILED)
-            return
+        log.info("All credentials received! Starting Wi-Fi join task...")
+        self.join_task = self.loop.create_task(self._do_join(self.ssid, self.password, self.token))
 
-        log.info("Joined WiFi network %r", ssid)
-        persist_token(token)
-        # Reload the token right away; the recorder tolerates being offline.
-        subprocess.run(["systemctl", "restart", "simpleaq.service"], check=False)
+    async def _do_join(self, ssid: str, password: str, token: str):
+        self.set_status(STATUS_CONNECTING)
+        final_status = await asyncio.to_thread(_sync_join, ssid, password, token)
+        self.set_status(final_status)
 
-        if wait_for_internet(INTERNET_CHECK_WINDOW_SEC):
-            log.info("Backend reachable; provisioning complete")
-            GLib.idle_add(self._finish, STATUS_CONNECTED)
-        else:
-            log.warning("Joined WiFi but %s is unreachable; token saved, uploads will "
-                        "start once the network allows", INTERNET_CHECK_HOST)
-            GLib.idle_add(self._set_status, STATUS_NO_INTERNET)
-
-    # ---- main loop ----
-
-    def _set_status(self, status):
-        self.status = status
-        log.info("Status -> %s", status)
-        if self.status_chrc is not None:
-            self.status_chrc.set_value(to_bytes(status))
-        return False  # when called through idle_add: run once
-
-    def _finish(self, status):
-        self._set_status(status)
-        self.complete = True
-        self._reevaluate_shutdown()
-        return False
-
-    def on_connect(self, *args, **kwargs):
-        log.info("Client connected")
-        self._reevaluate_shutdown()
-
-    def on_disconnect(self, *args, **kwargs):
-        log.info("Client disconnected")
-        self._reevaluate_shutdown()
-        if not self.complete and self.peripheral is not None:
-            try:
-                log.info("Resuming BLE advertising...")
-                self.peripheral.ad_manager.register_advertisement(self.peripheral.advert, {})
-                log.info("BLE advertising resumed successfully")
-            except Exception as e:
-                log.warning("Could not re-register advertisement directly: %s. Trying unregister first...", e)
-                try:
-                    self.peripheral.ad_manager.unregister_advertisement(self.peripheral.advert)
-                except Exception:
-                    pass
-                try:
-                    self.peripheral.ad_manager.register_advertisement(self.peripheral.advert, {})
-                    log.info("BLE advertising resumed successfully")
-                except Exception as ex:
-                    log.error("Failed to re-register advertisement: %s", ex)
-
-    def _reevaluate_shutdown(self):
-        if not self.complete:
-            self._cancel_shutdown()
-        elif connected_client_count() > 0:
-            self._cancel_shutdown()
-        else:
-            self._schedule_shutdown()
-
-    def _schedule_shutdown(self):
-        if self.shutdown_source is None:
-            log.info("Provisioning complete; stopping BLE in %d s unless a client reconnects",
-                     SHUTDOWN_GRACE_SEC)
-            self.shutdown_source = GLib.timeout_add_seconds(SHUTDOWN_GRACE_SEC, self._shutdown)
-
-    def _cancel_shutdown(self):
-        if self.shutdown_source is not None:
-            GLib.source_remove(self.shutdown_source)
-            self.shutdown_source = None
-
-    def _shutdown(self):
-        self.shutdown_source = None
-        if connected_client_count() > 0:
-            log.info("A client reconnected; staying up")
-            return False
-        log.info("Stopping BLE provisioning service")
-        self.peripheral.mainloop.quit()
-        return False
+        if final_status in (STATUS_CONNECTED, STATUS_NO_INTERNET):
+            log.info("Provisioning succeeded! Server will shutdown in %d s", SHUTDOWN_GRACE_SEC)
+            await asyncio.sleep(SHUTDOWN_GRACE_SEC)
+            self.stop_event.set()
 
 
-def wait_for_adapter():
-    deadline = time.monotonic() + ADAPTER_WAIT_SEC
-    while True:
-        try:
-            adapters = list(adapter.Adapter.available())
-        except Exception as e:
-            log.warning("Bluetooth adapter lookup failed: %s", e)
-            adapters = []
-        if adapters:
-            return adapters[0]
-        if time.monotonic() >= deadline:
-            return None
-        time.sleep(2)
+async def run_server(loop: asyncio.AbstractEventLoop):
+    prov = BlessProvisioner(loop)
+    server = BlessServer(name=LOCAL_NAME, loop=loop)
+    prov.server = server
+
+    server.read_request_func = prov.read_request
+    server.write_request_func = prov.write_request
+
+    await server.add_new_service(SERVICE_UUID)
+
+    write_flags = (
+        GATTCharacteristicProperties.write |
+        GATTCharacteristicProperties.write_without_response
+    )
+    read_write_flags = (
+        GATTCharacteristicProperties.read |
+        GATTCharacteristicProperties.write |
+        GATTCharacteristicProperties.write_without_response
+    )
+    read_notify_flags = (
+        GATTCharacteristicProperties.read |
+        GATTCharacteristicProperties.notify
+    )
+
+    permissions_rw = (
+        GATTAttributePermissions.readable |
+        GATTAttributePermissions.writeable
+    )
+    permissions_w = GATTAttributePermissions.writeable
+    permissions_r = GATTAttributePermissions.readable
+
+    await server.add_new_characteristic(
+        SERVICE_UUID, SSID_UUID, write_flags, None, permissions_w
+    )
+    await server.add_new_characteristic(
+        SERVICE_UUID, PASS_UUID, write_flags, None, permissions_w
+    )
+    await server.add_new_characteristic(
+        SERVICE_UUID, TOKEN_UUID, write_flags, None, permissions_w
+    )
+    await server.add_new_characteristic(
+        SERVICE_UUID, DEVICE_ID_UUID, read_write_flags,
+        bytearray(get_device_id().encode("utf-8")), permissions_rw
+    )
+    await server.add_new_characteristic(
+        SERVICE_UUID, STATUS_UUID, read_notify_flags,
+        bytearray(STATUS_IDLE.encode("utf-8")), permissions_r
+    )
+
+    log.info("Starting Bless BLE GATT server (%r)...", LOCAL_NAME)
+    await server.start()
+    log.info("Bless BLE GATT server is actively advertising!")
+
+    await prov.stop_event.wait()
+    log.info("Stopping BLE server...")
+    await server.stop()
+    log.info("Bless BLE server stopped.")
 
 
 def main():
     if is_provisioned():
-        log.info("Device already has a token; not advertising. Use the reset endpoint to re-provision.")
+        log.info("Device is already provisioned; not advertising.")
         return 0
 
-    dongle = wait_for_adapter()
-    if dongle is None:
-        log.error("No Bluetooth adapter found after %d s", ADAPTER_WAIT_SEC)
-        return 1
-
-    prov = Provisioner()
-    ble = peripheral.Peripheral(dongle.address, local_name=LOCAL_NAME)
-    prov.peripheral = ble
-
-    ble.add_service(srv_id=1, uuid=SERVICE_UUID, primary=True)
-    # Clear primary_services so bluezero doesn't pack the 128-bit UUID into the 31-byte advertisement packet
-    # (The service remains fully registered as a GATT Primary Service in self.services)
-    ble.primary_services.clear()
-
-    write_flags = ["write", "write-without-response"]
-    ble.add_characteristic(srv_id=1, chr_id=1, uuid=SSID_UUID, value=[], notifying=False,
-                           flags=write_flags, write_callback=prov.write_ssid)
-    ble.add_characteristic(srv_id=1, chr_id=2, uuid=PASS_UUID, value=[], notifying=False,
-                           flags=write_flags, write_callback=prov.write_pass)
-    ble.add_characteristic(srv_id=1, chr_id=3, uuid=TOKEN_UUID, value=[], notifying=False,
-                           flags=write_flags, write_callback=prov.write_token)
-    ble.add_characteristic(srv_id=1, chr_id=4, uuid=DEVICE_ID_UUID, value=[], notifying=False,
-                           flags=["read"] + write_flags,
-                           read_callback=read_device_id, write_callback=write_device_id)
-    ble.add_characteristic(srv_id=1, chr_id=5, uuid=STATUS_UUID, value=to_bytes(STATUS_IDLE),
-                           notifying=False, flags=["read", "notify"],
-                           read_callback=prov.read_status, notify_callback=prov.on_status_notify)
-    prov.status_chrc = ble.characteristics[-1]
-
-    ble.on_connect = prov.on_connect
-    ble.on_disconnect = prov.on_disconnect
-
-    log.info("Advertising %r on %s", LOCAL_NAME, dongle.address)
-    ble.publish()  # runs the main loop until _shutdown() quits it
-
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        ble.ad_manager.unregister_advertisement(ble.advert)
-    except Exception:
-        pass  # bluetoothd drops it anyway once this process exits
+        loop.run_until_complete(run_server(loop))
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        loop.close()
     return 0
 
 

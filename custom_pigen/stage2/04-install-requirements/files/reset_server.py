@@ -85,8 +85,36 @@ def reset_device():
     # 4. Restart the BLE service so it picks up the cleared token and advertises.
     subprocess.Popen(["systemctl", "restart", "simpleaq-ble.service"])
 
-    return jsonify({"status": "Reset successful. BLE provisioning restarted."}), 200
+@app.route('/provision', methods=['POST'])
+def provision_device():
+    from flask import request
+    data = request.get_json(force=True, silent=True) or request.form or {}
+    ssid = (data.get('ssid') or '').strip()
+    password = data.get('password', '')
+    token = (data.get('token') or '').strip()
+    device_id = (data.get('device_id') or '').strip()
+
+    if not ssid or not token:
+        return jsonify({"error": "Missing ssid or token"}), 400
+
+    if device_id:
+        try:
+            dotenv.set_key(ENV_FILE, "influx_bucket", device_id)
+        except Exception as e:
+            app.logger.error("Could not set influx_bucket: %s", e)
+
+    try:
+        from ble_setup import configure_wifi_profile, activate_wifi, persist_token
+        configure_wifi_profile(ssid, password)
+        activate_wifi()
+        persist_token(token)
+        subprocess.run(["systemctl", "restart", "simpleaq.service"], check=False)
+        return jsonify({"status": "Provisioning successful"}), 200
+    except Exception as e:
+        app.logger.exception("Provisioning failed: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=80)
+
