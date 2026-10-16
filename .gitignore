@@ -4,3 +4,12 @@ data
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
+
+# Local Pi-Gen build directories and outputs
+PiGen/
+deploy/
+build/
+*.img
+*.img.xz
+*.img.zip
+
