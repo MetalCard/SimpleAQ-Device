@@ -9,10 +9,6 @@ on_chroot << EOF
 
     python3 -m pip install --upgrade pip
     python3 -m pip install -r /simpleaq/requirements.txt
-    
-    # --- Install bluez-tools for the background BT agent ---
-    apt-get update
-    apt-get install -y bluez-tools
 EOF
 
 # Load i2c module at runtime.
@@ -32,13 +28,11 @@ cp files/wifi-watchdog.timer "${ROOTFS_DIR}/etc/systemd/system"
 mkdir -p "${ROOTFS_DIR}/etc/NetworkManager/dispatcher.d"
 cp files/90-simpleaq-ap-channel "${ROOTFS_DIR}/etc/NetworkManager/dispatcher.d/90-simpleaq-ap-channel"
 
-# --- Copy BLE, Reset scripts, and BT Agent services ---
+# --- Copy BLE and Reset scripts ---
 cp files/simpleaq-ble.service "${ROOTFS_DIR}/etc/systemd/system/"
 cp files/ble_setup.py "${ROOTFS_DIR}/usr/local/bin/"
 cp files/simpleaq-reset.service "${ROOTFS_DIR}/etc/systemd/system/"
 cp files/reset_server.py "${ROOTFS_DIR}/usr/local/bin/"
-cp files/bt_agent.py "${ROOTFS_DIR}/usr/local/bin/"
-cp files/simpleaq-bt-agent.service "${ROOTFS_DIR}/etc/systemd/system/"
 
 # SimpleAQ uses python-dotenv.
 on_chroot << EOF
@@ -83,13 +77,6 @@ on_chroot << EOF
 
         chown root:root /usr/local/bin/reset_server.py
         chmod 755 /usr/local/bin/reset_server.py
-
-        # Enable the BT Agent Service
-        chown root:root /usr/local/bin/bt_agent.py
-        chmod 755 /usr/local/bin/bt_agent.py
-        chown root:root /etc/systemd/system/simpleaq-bt-agent.service
-        chmod 644 /etc/systemd/system/simpleaq-bt-agent.service
-        systemctl enable simpleaq-bt-agent.service
 
         chown root:root /etc/NetworkManager/dispatcher.d/90-simpleaq-ap-channel
         chmod 755 /etc/NetworkManager/dispatcher.d/90-simpleaq-ap-channel
@@ -148,11 +135,11 @@ on_chroot << EOF
         chmod a+x /etc/rc.local
 EOF
 
-# Force BLE-only mode and enable PIN-less "Just Works" pairing.
-# DiscoverableTimeout = 0 keeps the adapter discoverable; with the default
-# 180 s timeout bluetoothd strips the General Discoverable flag from our
-# advertisement three minutes after the provisioning service starts.
+# Pure unbonded BLE peripheral configuration:
+# - ControllerMode = le: Strictly BLE; disables Classic BR/EDR completely.
+# - Bondable = false: Explicitly informs connecting centrals (Android) that pairing/bonding is disabled.
+# - ReverseServiceDiscovery = false: Prevents BlueZ from probing connecting devices.
+# - DiscoverableTimeout = 0: Adapter never stops being discoverable.
 on_chroot << EOF
-    # Insert configurations directly under the [General] header in main.conf
-    sed -i '/^\[General\]/a ControllerMode = le\nJustWorksRepairing = always\nReverseServiceDiscovery = false\nDiscoverableTimeout = 0\nExperimental = true' /etc/bluetooth/main.conf
+    sed -i '/^\[General\]/a ControllerMode = le\nBondable = false\nReverseServiceDiscovery = false\nDiscoverableTimeout = 0\nExperimental = true' /etc/bluetooth/main.conf
 EOF
