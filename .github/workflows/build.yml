@@ -55,6 +55,7 @@ jobs:
         IMAGE=SimpleAQ-${GITHUB_REF##*/}-$NOW
         echo IMG_NAME=$IMAGE                        > config
         echo DEPLOY_COMPRESSION=none               >> config
+        echo APT_MIRROR=http://mirrors.ocf.berkeley.edu/raspbian/raspbian/ >> config
         echo TARGET_HOSTNAME=simpleaq              >> config
         echo TIMEZONE_DEFAULT=Etc/UTC              >> config
         echo FIRST_USER_NAME=pi                    >> config
@@ -144,6 +145,7 @@ jobs:
         IMAGE=INSECURE-DEBUG-SimpleAQ-${GITHUB_REF##*/}-$NOW
         echo IMG_NAME=$IMAGE                        > config
         echo DEPLOY_COMPRESSION=none               >> config
+        echo APT_MIRROR=http://mirrors.ocf.berkeley.edu/raspbian/raspbian/ >> config
         echo ENABLE_SSH=1                          >> config
         echo TARGET_HOSTNAME=simpleaq              >> config
         echo TIMEZONE_DEFAULT=Etc/UTC              >> config
