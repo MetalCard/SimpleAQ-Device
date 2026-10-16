@@ -32,6 +32,8 @@ _NEW_SSID=$(grep "^\s*ssid=" /etc/hostapd/hostapd.conf | cut -d'"' -f2)
 if [ "$_CURRENT_SSID" != "$_NEW_SSID" ]; then
   echo "SSID has changed from $_CURRENT_SSID to $_NEW_SSID. Restarting hostapd..."
   systemctl restart hostapd
-fi
+# Ensure Wi-Fi and Bluetooth are always unblocked and power management is disabled
+rfkill unblock all || true
+iw dev wlan0 set power_save off 2>/dev/null || true
 
 exit 0

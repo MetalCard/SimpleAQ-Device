@@ -79,6 +79,10 @@ if [ "$_CURRENT_SSID" != "$_PI_SSID" ] || [ ! -z "$_SIMPLEAQ_HOSTAPD_PASSWORD" ]
   fi
 fi
 
+# Ensure Wi-Fi and Bluetooth are always unblocked and power management is disabled
+rfkill unblock all || true
+iw dev wlan0 set power_save off 2>/dev/null || true
+
 # Don't allow any connections we didn't explicitly request.
 iptables-legacy -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
 iptables-legacy -A INPUT -i wlan0 -j DROP

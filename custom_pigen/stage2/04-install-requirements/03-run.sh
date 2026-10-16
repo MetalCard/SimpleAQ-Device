@@ -59,8 +59,8 @@ on_chroot << EOF
         chown root:root /etc/systemd/system/wifi-watchdog.timer
         chmod 644 /etc/systemd/system/wifi-watchdog.timer
 
-        # Ensure bluetooth radio is not soft-blocked on first boot
-        rfkill unblock bluetooth || true
+        # Ensure wifi and bluetooth radios are not soft-blocked on first boot
+        rfkill unblock all || true
 
         # BLE Provisioning Service
         chown root:root /etc/systemd/system/simpleaq-ble.service
