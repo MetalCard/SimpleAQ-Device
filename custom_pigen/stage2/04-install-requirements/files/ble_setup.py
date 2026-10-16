@@ -243,21 +243,34 @@ class Provisioner:
         self.worker = None
         self.complete = False
         self.shutdown_source = None
+        self.join_timer_source = None
 
     # ---- GATT callbacks; BlueZ invokes these on the GLib main loop ----
 
-    def write_ssid(self, value, options):
-        self.ssid = to_text(value)
+    @staticmethod
+    def _apply_write(current, value, options):
+        chunk = bytes(value)
+        offset = 0
+        if isinstance(options, dict) and "offset" in options:
+            offset = int(options["offset"])
+        if offset > 0 and current:
+            prev = current.encode("utf-8")
+            merged = prev[:offset] + chunk
+            return merged.decode("utf-8", errors="replace")
+        return chunk.decode("utf-8", errors="replace")
+
+    def write_ssid(self, value, options=None):
+        self.ssid = self._apply_write(self.ssid, value, options)
         log.info("Received SSID %r", self.ssid)
         self._maybe_start_join()
 
-    def write_pass(self, value, options):
-        self.password = to_text(value)
+    def write_pass(self, value, options=None):
+        self.password = self._apply_write(self.password, value, options)
         log.info("Received WiFi password (%d characters)", len(self.password))
         self._maybe_start_join()
 
-    def write_token(self, value, options):
-        self.token = to_text(value)
+    def write_token(self, value, options=None):
+        self.token = self._apply_write(self.token, value, options)
         log.info("Received token (%d characters)", len(self.token))
         self._maybe_start_join()
 
@@ -272,9 +285,18 @@ class Provisioner:
     def _maybe_start_join(self):
         if not self.ssid or self.password is None or not self.token:
             return
+        if self.join_timer_source is not None:
+            GLib.source_remove(self.join_timer_source)
+        # Debounce by 400ms so multi-packet BLE Long Writes (offset > 0) finish arriving first
+        self.join_timer_source = GLib.timeout_add(400, self._execute_join)
+
+    def _execute_join(self):
+        self.join_timer_source = None
+        if not self.ssid or self.password is None or not self.token:
+            return False
         if self.worker is not None and self.worker.is_alive():
             log.info("WiFi join already in progress; ignoring repeated write")
-            return
+            return False
         # Allow re-provisioning within the same session.
         self.complete = False
         self._cancel_shutdown()
@@ -283,6 +305,7 @@ class Provisioner:
                                        args=(self.ssid, self.password, self.token),
                                        daemon=True)
         self.worker.start()
+        return False
 
     # ---- worker thread; report back to the main loop through GLib.idle_add ----
 
