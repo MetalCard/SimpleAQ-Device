@@ -82,20 +82,47 @@ def reset_device():
     # 3. Stop SimpleAQ data collection service.
     subprocess.run(["systemctl", "stop", "simpleaq.service"], check=False)
 
-    # 4. Restart the BLE service so it picks up the cleared token and advertises.
-    subprocess.Popen(["systemctl", "restart", "simpleaq-ble.service"])
+    # 4. Stop SimpleAQ data collection service.
+    subprocess.run(["systemctl", "stop", "simpleaq.service"], check=False)
+    return jsonify({"status": "Reset complete"}), 200
 
-@app.route('/provision', methods=['POST'])
+
+def configure_wifi_profile(ssid, password):
+    args = [
+        "nmcli", "connection", "modify", WIFI_CONNECTION,
+        "802-11-wireless.ssid", ssid,
+        "802-11-wireless-security.key-mgmt", "wpa-psk",
+        "connection.autoconnect", "yes",
+        "802-11-wireless.powersave", "2"
+    ]
+    if password:
+        args.extend(["802-11-wireless-security.psk", password])
+    subprocess.run(args, check=True)
+
+
+def activate_wifi():
+    subprocess.run(["nmcli", "connection", "reload"], check=False)
+    subprocess.Popen(["nmcli", "connection", "up", WIFI_CONNECTION])
+
+
+def persist_token(token):
+    os.makedirs(os.path.dirname(TOKEN_ENV_FILE), exist_ok=True)
+    with open(TOKEN_ENV_FILE, "w") as f:
+        f.write(f"influx_token={token}\n")
+    dotenv.set_key(ENV_FILE, "influx_token", token, quote_mode="always")
+
+
+@app.route('/provision', methods=['POST', 'GET'])
 def provision_device():
     from flask import request
     data = request.get_json(force=True, silent=True) or request.form or {}
-    ssid = (data.get('ssid') or '').strip()
-    password = data.get('password', '')
-    token = (data.get('token') or '').strip()
-    device_id = (data.get('device_id') or '').strip()
+    ssid = (data.get('ssid') or request.values.get('ssid') or '').strip()
+    password = data.get('password') or request.values.get('password') or ''
+    token = (data.get('device_token') or data.get('token') or request.values.get('device_token') or request.values.get('token') or '').strip()
+    device_id = (data.get('device_id') or request.values.get('device_id') or '').strip()
 
-    if not ssid or not token:
-        return jsonify({"error": "Missing ssid or token"}), 400
+    if not ssid:
+        return jsonify({"error": "Missing ssid"}), 400
 
     if device_id:
         try:
@@ -104,17 +131,18 @@ def provision_device():
             app.logger.error("Could not set influx_bucket: %s", e)
 
     try:
-        from ble_setup import configure_wifi_profile, activate_wifi, persist_token
         configure_wifi_profile(ssid, password)
         activate_wifi()
-        persist_token(token)
+        if token:
+            persist_token(token)
         subprocess.run(["systemctl", "restart", "simpleaq.service"], check=False)
-        return jsonify({"status": "Provisioning successful"}), 200
+        return jsonify({"success": True, "status": "Provisioning successful"}), 200
     except Exception as e:
         app.logger.exception("Provisioning failed: %s", e)
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=80)
+    app.run(host='0.0.0.0', port=8080)
+
 

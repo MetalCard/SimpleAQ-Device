@@ -28,9 +28,7 @@ cp files/wifi-watchdog.timer "${ROOTFS_DIR}/etc/systemd/system"
 mkdir -p "${ROOTFS_DIR}/etc/NetworkManager/dispatcher.d"
 cp files/90-simpleaq-ap-channel "${ROOTFS_DIR}/etc/NetworkManager/dispatcher.d/90-simpleaq-ap-channel"
 
-# --- Copy BLE and Reset scripts ---
-cp files/simpleaq-ble.service "${ROOTFS_DIR}/etc/systemd/system/"
-cp files/ble_setup.py "${ROOTFS_DIR}/usr/local/bin/"
+# --- Copy Reset & SoftAP Provisioning script ---
 cp files/simpleaq-reset.service "${ROOTFS_DIR}/etc/systemd/system/"
 cp files/reset_server.py "${ROOTFS_DIR}/usr/local/bin/"
 
@@ -61,14 +59,6 @@ on_chroot << EOF
 
         # Ensure wifi and bluetooth radios are not soft-blocked on first boot
         rfkill unblock all || true
-
-        # BLE Provisioning Service
-        chown root:root /etc/systemd/system/simpleaq-ble.service
-        chmod 644 /etc/systemd/system/simpleaq-ble.service
-        systemctl enable simpleaq-ble.service
-        
-        chown root:root /usr/local/bin/ble_setup.py
-        chmod 755 /usr/local/bin/ble_setup.py
 
         # Local Reset Web Server
         chown root:root /etc/systemd/system/simpleaq-reset.service
@@ -135,11 +125,3 @@ on_chroot << EOF
         chmod a+x /etc/rc.local
 EOF
 
-# Pure unbonded BLE peripheral configuration:
-# - ControllerMode = le: Strictly BLE; disables Classic BR/EDR completely.
-# - Bondable = false: Explicitly informs connecting centrals (Android) that pairing/bonding is disabled.
-# - ReverseServiceDiscovery = false: Prevents BlueZ from probing connecting devices.
-# - DiscoverableTimeout = 0: Adapter never stops being discoverable.
-on_chroot << EOF
-    sed -i '/^\[General\]/a ControllerMode = le\nBondable = false\nReverseServiceDiscovery = false\nDiscoverableTimeout = 0\nExperimental = true' /etc/bluetooth/main.conf
-EOF

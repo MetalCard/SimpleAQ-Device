@@ -326,3 +326,65 @@ def wifi_watchdog():
   response = make_response(result.stdout, 200)
   response.mimetype = 'text/plain'
   return response
+
+@app.route('/provision', methods=['GET', 'POST'])
+def provision_api():
+  """Direct API endpoint for mobile app provisioning over SoftAP."""
+  ssid = None
+  password = None
+  token = None
+  device_id = None
+
+  if request.is_json:
+    data = request.get_json(silent=True) or {}
+    ssid = data.get('ssid') or data.get('local_wifi_network')
+    password = data.get('password') or data.get('local_wifi_password')
+    token = data.get('device_token') or data.get('token') or data.get('influx_token')
+    device_id = data.get('device_id')
+  else:
+    ssid = request.values.get('ssid') or request.values.get('local_wifi_network')
+    password = request.values.get('password') or request.values.get('local_wifi_password')
+    token = request.values.get('device_token') or request.values.get('token') or request.values.get('influx_token')
+    device_id = request.values.get('device_id')
+
+  if not ssid:
+    return json.dumps({'success': False, 'error': 'Missing ssid'}), 400, {'Content-Type': 'application/json'}
+
+  try:
+    psk = ''
+    if password:
+      if len(password) < 8:
+        psk = password
+      elif len(password) < 64:
+        psk = get_psk(ssid, password)
+      else:
+        psk = password
+
+    set_wifi_credentials(ssid, psk, connection_name='Wifi')
+
+    env_file = os.getenv('env_file', '/etc/environment')
+    if token:
+      dotenv.set_key(env_file, 'influx_token', token, quote_mode='always')
+      try:
+        os.makedirs('/etc/simpleaq', exist_ok=True)
+        with open('/etc/simpleaq/device_token.env', 'w') as f:
+          f.write(f'influx_token={token}\n')
+      except Exception as e:
+        app.logger.warning(f'Could not write /etc/simpleaq/device_token.env: {e}')
+
+    if device_id:
+      dotenv.set_key(env_file, 'simpleaq_device_id', device_id, quote_mode='always')
+
+    subprocess.run(['nmcli', 'connection', 'reload'], check=False)
+    subprocess.Popen(['nmcli', 'connection', 'up', 'Wifi'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    return json.dumps({
+      'success': True,
+      'message': f'Configured network "{ssid}" successfully.',
+      'ssid': ssid
+    }), 200, {'Content-Type': 'application/json'}
+
+  except Exception as e:
+    app.logger.error(f'Provisioning failed: {e}')
+    return json.dumps({'success': False, 'error': str(e)}), 500, {'Content-Type': 'application/json'}
+
