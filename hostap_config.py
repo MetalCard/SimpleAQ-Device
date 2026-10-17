@@ -8,6 +8,8 @@ import shlex
 import subprocess
 import sqlite3
 import logging
+import threading
+import time
 from localstorage.localsqlite import LocalSqlite
 
 import netifaces as ni
@@ -57,7 +59,6 @@ def set_wifi_credentials(ssid, psk, connection_name="Wifi"):
                "connection.autoconnect", "yes",
                "connection.autoconnect-retries", "0",
                "802-11-wireless.powersave", "2",
-               "802-11-wireless.band", "bg",
                "802-11-wireless-security.psk", psk,
                "802-11-wireless-security.psk-flags", "0",
                "ipv4.dns-priority", "-100",
@@ -69,7 +70,6 @@ def set_wifi_credentials(ssid, psk, connection_name="Wifi"):
           subprocess.run(
               ["nmcli", "connection", "modify", connection_name,
                "802-11-wireless.ssid", ssid,
-               "802-11-wireless.band", "bg",
                "connection.autoconnect", "yes",
                "connection.autoconnect-retries", "0",
                "802-11-wireless.powersave", "2",
@@ -327,6 +327,17 @@ def wifi_watchdog():
   response.mimetype = 'text/plain'
   return response
 
+def transition_to_station_mode():
+  """Tear down SoftAP and bring up home Wi-Fi station link.
+  Runs in background after a 2s delay so the HTTP 200 response reaches the client first."""
+  time.sleep(2)
+  subprocess.run(['systemctl', 'stop', 'ap0-setup.service'], check=False)
+  subprocess.run(['nmcli', 'connection', 'down', 'SimpleAQ-AP'], check=False)
+  subprocess.run(['iw', 'dev', 'ap0', 'del'], check=False)
+  subprocess.run(['nmcli', 'connection', 'reload'], check=False)
+  subprocess.run(['nmcli', 'connection', 'up', 'Wifi'], check=False)
+  subprocess.run(['systemctl', 'restart', 'simpleaq.service'], check=False)
+
 @app.route('/provision', methods=['GET', 'POST'])
 def provision_api():
   """Direct API endpoint for mobile app provisioning over SoftAP."""
@@ -374,9 +385,9 @@ def provision_api():
 
     if device_id:
       dotenv.set_key(env_file, 'simpleaq_device_id', device_id, quote_mode='always')
+      dotenv.set_key(env_file, 'influx_bucket', device_id, quote_mode='always')
 
-    subprocess.run(['nmcli', 'connection', 'reload'], check=False)
-    subprocess.Popen(['nmcli', 'connection', 'up', 'Wifi'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    threading.Thread(target=transition_to_station_mode, daemon=True).start()
 
     return json.dumps({
       'success': True,

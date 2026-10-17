@@ -22,6 +22,7 @@ cp files/NetworkManager.conf "${ROOTFS_DIR}/etc/NetworkManager/NetworkManager.co
 cp files/chrony.conf "${ROOTFS_DIR}/etc/chrony/chrony.conf"
 cp files/simpleaq-ap.nmconnection "${ROOTFS_DIR}/etc/NetworkManager/system-connections/"
 cp files/ap0-setup.service "${ROOTFS_DIR}/etc/systemd/system"
+cp files/ap0-setup.sh "${ROOTFS_DIR}/usr/local/bin/ap0-setup.sh"
 cp files/wifi-watchdog.sh "${ROOTFS_DIR}/usr/local/bin/wifi-watchdog.sh"
 cp files/wifi-watchdog.service "${ROOTFS_DIR}/etc/systemd/system"
 cp files/wifi-watchdog.timer "${ROOTFS_DIR}/etc/systemd/system"
@@ -44,6 +45,8 @@ on_chroot << EOF
         chmod 644 /etc/systemd/system/simpleaq.service
         systemctl enable simpleaq
 
+        chown root:root /usr/local/bin/ap0-setup.sh
+        chmod 755 /usr/local/bin/ap0-setup.sh
         chown root:root /etc/systemd/system/ap0-setup.service
         chmod 644 /etc/systemd/system/ap0-setup.service
         systemctl enable ap0-setup.service

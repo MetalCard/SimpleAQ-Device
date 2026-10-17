@@ -41,15 +41,10 @@ if [ -z "$SSID" ] || [ "$SSID" = "your_wifi_name" ]; then
 fi
 
 recreate_ap_if_missing() {
-    # Bouncing or reloading wlan0 destroys the virtual ap0 interface.
-    # Recreate it so the configuration AP keeps working.
-    if ! ip link show "$AP_IFACE" &>/dev/null; then
-        logger -t wifi-watchdog "Recreating $AP_IFACE"
-        iw dev "$IFACE" interface add "$AP_IFACE" type __ap 2>/dev/null || true
-        ip link set "$AP_IFACE" up 2>/dev/null || true
-        nmcli device set "$AP_IFACE" managed yes 2>/dev/null || true
-        nmcli connection up "$AP_CONN" 2>/dev/null || true
-    fi
+    # When provisioned, ap0 must not be recreated during recovery because
+    # concurrent AP+STA across different channels prevents wlan0 association
+    # on the Pi 3's single radio.
+    return 0
 }
 
 link_is_healthy() {

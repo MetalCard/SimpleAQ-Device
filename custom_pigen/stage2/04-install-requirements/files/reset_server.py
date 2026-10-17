@@ -1,11 +1,12 @@
-"""Local reset endpoint: forget WiFi credentials and the API token, then
-bring BLE provisioning back.  Served on the SimpleAQ-AP network."""
+"""Local reset and provisioning server for SimpleAQ."""
 
 import os
 import subprocess
+import threading
+import time
 
 import dotenv
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
@@ -26,13 +27,7 @@ def nmcli(*args):
 
 
 def forget_wifi_networks():
-    """Clear WiFi credentials without destroying the SimpleAQ-AP profile.
-
-    The shared "Wifi" profile is reset to its placeholder values rather than
-    deleted, because hostap_config.py, wifi-watchdog.sh and ble_setup.py all
-    look it up by name.  Any other station profile (for example one created by
-    an older image with `nmcli dev wifi connect`) is deleted.
-    """
+    """Clear WiFi credentials without destroying the SimpleAQ-AP profile."""
     try:
         lines = nmcli("-t", "-f", "NAME,TYPE", "connection", "show").stdout.splitlines()
     except Exception as e:
@@ -51,9 +46,8 @@ def forget_wifi_networks():
                 nmcli("connection", "modify", name,
                       "802-11-wireless.ssid", WIFI_SSID_PLACEHOLDER,
                       "802-11-wireless-security.key-mgmt", "wpa-psk",
-                      "802-11-wireless-security.psk", WIFI_PSK_PLACEHOLDER)
-                # Deactivate so the device actually goes offline.  Provisioning
-                # re-activates the profile with an explicit `connection up`.
+                      "802-11-wireless-security.psk", WIFI_PSK_PLACEHOLDER,
+                      "802-11-wireless-security.psk-flags", "0")
                 subprocess.run(["nmcli", "connection", "down", name], check=False, timeout=60)
             else:
                 nmcli("connection", "delete", name)
@@ -63,11 +57,10 @@ def forget_wifi_networks():
 
 @app.route('/reset', methods=['POST', 'GET'])
 def reset_device():
-    # 1. Forget WiFi credentials (keeps the setup access point).
+    # 1. Forget WiFi credentials
     forget_wifi_networks()
 
-    # 2. Reset the stored SimpleAQ device token.  ble_setup.py treats the
-    #    placeholder as "unprovisioned" and starts advertising again.
+    # 2. Reset the stored SimpleAQ device token
     try:
         dotenv.set_key(ENV_FILE, "influx_token", TOKEN_PLACEHOLDER)
     except Exception as e:
@@ -79,11 +72,12 @@ def reset_device():
         except Exception as e:
             app.logger.error("Could not remove %s: %s", TOKEN_ENV_FILE, e)
 
-    # 3. Stop SimpleAQ data collection service.
+    # 3. Stop SimpleAQ data collection service
     subprocess.run(["systemctl", "stop", "simpleaq.service"], check=False)
 
-    # 4. Stop SimpleAQ data collection service.
-    subprocess.run(["systemctl", "stop", "simpleaq.service"], check=False)
+    # 4. Restore the SoftAP hotspot so the device can be provisioned again
+    subprocess.run(["systemctl", "restart", "ap0-setup.service"], check=False)
+
     return jsonify({"status": "Reset complete"}), 200
 
 
@@ -91,18 +85,35 @@ def configure_wifi_profile(ssid, password):
     args = [
         "nmcli", "connection", "modify", WIFI_CONNECTION,
         "802-11-wireless.ssid", ssid,
-        "802-11-wireless-security.key-mgmt", "wpa-psk",
         "connection.autoconnect", "yes",
-        "802-11-wireless.powersave", "2"
+        "connection.autoconnect-retries", "0",
+        "802-11-wireless.powersave", "2",
+        "ipv4.dns-priority", "-100",
+        "ipv4.route-metric", "100"
     ]
     if password:
-        args.extend(["802-11-wireless-security.psk", password])
-    subprocess.run(args, check=True)
+        args.extend([
+            "802-11-wireless-security.key-mgmt", "wpa-psk",
+            "802-11-wireless-security.psk", password,
+            "802-11-wireless-security.psk-flags", "0"
+        ])
+        subprocess.run(args, check=True)
+    else:
+        subprocess.run(args, check=True)
+        subprocess.run(["nmcli", "connection", "modify", WIFI_CONNECTION,
+                        "remove", "802-11-wireless-security"], check=False)
 
 
-def activate_wifi():
+def transition_to_station_mode():
+    """Tear down SoftAP and bring up home Wi-Fi station link.
+    Runs in background after a 2s delay so the HTTP 200 response reaches the client first."""
+    time.sleep(2)
+    subprocess.run(["systemctl", "stop", "ap0-setup.service"], check=False)
+    subprocess.run(["nmcli", "connection", "down", AP_CONNECTION], check=False)
+    subprocess.run(["iw", "dev", "ap0", "del"], check=False)
     subprocess.run(["nmcli", "connection", "reload"], check=False)
-    subprocess.Popen(["nmcli", "connection", "up", WIFI_CONNECTION])
+    subprocess.run(["nmcli", "connection", "up", WIFI_CONNECTION], check=False)
+    subprocess.run(["systemctl", "restart", "simpleaq.service"], check=False)
 
 
 def persist_token(token):
@@ -114,7 +125,6 @@ def persist_token(token):
 
 @app.route('/provision', methods=['POST', 'GET'])
 def provision_device():
-    from flask import request
     data = request.get_json(force=True, silent=True) or request.form or {}
     ssid = (data.get('ssid') or request.values.get('ssid') or '').strip()
     password = data.get('password') or request.values.get('password') or ''
@@ -127,15 +137,17 @@ def provision_device():
     if device_id:
         try:
             dotenv.set_key(ENV_FILE, "influx_bucket", device_id)
+            dotenv.set_key(ENV_FILE, "simpleaq_device_id", device_id)
         except Exception as e:
-            app.logger.error("Could not set influx_bucket: %s", e)
+            app.logger.error("Could not set influx_bucket/device_id: %s", e)
 
     try:
         configure_wifi_profile(ssid, password)
-        activate_wifi()
         if token:
             persist_token(token)
-        subprocess.run(["systemctl", "restart", "simpleaq.service"], check=False)
+
+        threading.Thread(target=transition_to_station_mode, daemon=True).start()
+
         return jsonify({"success": True, "status": "Provisioning successful"}), 200
     except Exception as e:
         app.logger.exception("Provisioning failed: %s", e)
@@ -144,5 +156,3 @@ def provision_device():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
-
-
