@@ -75,8 +75,8 @@ def reset_device():
     # 3. Stop SimpleAQ data collection service
     subprocess.run(["systemctl", "stop", "simpleaq.service"], check=False)
 
-    # 4. Restore the SoftAP hotspot so the device can be provisioned again
-    subprocess.run(["systemctl", "restart", "ap0-setup.service"], check=False)
+    # 4. Ensure SimpleAQ-AP hotspot is active for re-provisioning
+    subprocess.run(["nmcli", "connection", "up", AP_CONNECTION], check=False)
 
     return jsonify({"status": "Reset complete"}), 200
 
@@ -105,14 +105,38 @@ def configure_wifi_profile(ssid, password):
 
 
 def transition_to_station_mode():
-    """Tear down SoftAP and bring up home Wi-Fi station link.
-    Runs in background after a 2s delay so the HTTP 200 response reaches the client first."""
+    """Temporarily pause AP to allow wlan0 to associate without channel collision,
+    then bring SimpleAQ-AP back up on the exact same channel as home Wi-Fi."""
     time.sleep(2)
-    subprocess.run(["systemctl", "stop", "ap0-setup.service"], check=False)
+    # 1. Pause AP so wlan0 can freely associate across channels
     subprocess.run(["nmcli", "connection", "down", AP_CONNECTION], check=False)
-    subprocess.run(["iw", "dev", "ap0", "del"], check=False)
+
+    # 2. Bring up home Wi-Fi connection
     subprocess.run(["nmcli", "connection", "reload"], check=False)
     subprocess.run(["nmcli", "connection", "up", WIFI_CONNECTION], check=False)
+
+    # 3. Detect connected channel on wlan0
+    channel = None
+    res = subprocess.run(["iw", "dev", "wlan0", "info"], stdout=subprocess.PIPE, text=True, check=False)
+    for line in res.stdout.splitlines():
+        if "channel" in line:
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                channel = parts[1]
+                break
+
+    # 4. Sync SimpleAQ-AP channel to match wlan0 and bring it back up
+    if channel:
+        subprocess.run(["nmcli", "connection", "modify", AP_CONNECTION, "802-11-wireless.channel", channel], check=False)
+
+    # Ensure ap0 interface exists and bring SimpleAQ-AP back up on matching channel
+    subprocess.run(
+        "ip link show ap0 >/dev/null 2>&1 || (iw dev wlan0 interface add ap0 type __ap 2>/dev/null && ip link set ap0 up 2>/dev/null && nmcli device set ap0 managed yes 2>/dev/null)",
+        shell=True, check=False
+    )
+    subprocess.run(["nmcli", "connection", "up", AP_CONNECTION], check=False)
+
+    # 5. Restart simpleaq data collection
     subprocess.run(["systemctl", "restart", "simpleaq.service"], check=False)
 
 

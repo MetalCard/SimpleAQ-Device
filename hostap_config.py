@@ -328,14 +328,30 @@ def wifi_watchdog():
   return response
 
 def transition_to_station_mode():
-  """Tear down SoftAP and bring up home Wi-Fi station link.
-  Runs in background after a 2s delay so the HTTP 200 response reaches the client first."""
+  """Temporarily pause AP to allow wlan0 to associate without channel collision,
+  then bring SimpleAQ-AP back up on the exact same channel as home Wi-Fi."""
   time.sleep(2)
-  subprocess.run(['systemctl', 'stop', 'ap0-setup.service'], check=False)
   subprocess.run(['nmcli', 'connection', 'down', 'SimpleAQ-AP'], check=False)
-  subprocess.run(['iw', 'dev', 'ap0', 'del'], check=False)
   subprocess.run(['nmcli', 'connection', 'reload'], check=False)
   subprocess.run(['nmcli', 'connection', 'up', 'Wifi'], check=False)
+
+  channel = None
+  res = subprocess.run(['iw', 'dev', 'wlan0', 'info'], stdout=subprocess.PIPE, text=True, check=False)
+  for line in res.stdout.splitlines():
+    if 'channel' in line:
+      parts = line.strip().split()
+      if len(parts) >= 2 and parts[1].isdigit():
+        channel = parts[1]
+        break
+
+  if channel:
+    subprocess.run(['nmcli', 'connection', 'modify', 'SimpleAQ-AP', '802-11-wireless.channel', channel], check=False)
+
+  subprocess.run(
+    'ip link show ap0 >/dev/null 2>&1 || (iw dev wlan0 interface add ap0 type __ap 2>/dev/null && ip link set ap0 up 2>/dev/null && nmcli device set ap0 managed yes 2>/dev/null)',
+    shell=True, check=False
+  )
+  subprocess.run(['nmcli', 'connection', 'up', 'SimpleAQ-AP'], check=False)
   subprocess.run(['systemctl', 'restart', 'simpleaq.service'], check=False)
 
 @app.route('/provision', methods=['GET', 'POST'])
