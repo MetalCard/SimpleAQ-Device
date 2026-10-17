@@ -46,9 +46,11 @@ on_chroot << EOF
 
         chown root:root /etc/systemd/system/ap0-setup.service
         chmod 644 /etc/systemd/system/ap0-setup.service
+        systemctl enable ap0-setup.service
 
         chown root:root /etc/systemd/system/hostap_config.service
         chmod 644 /etc/systemd/system/hostap_config.service
+        systemctl enable hostap_config.service
 
         chown root:root /usr/local/bin/wifi-watchdog.sh
         chmod 755 /usr/local/bin/wifi-watchdog.sh
